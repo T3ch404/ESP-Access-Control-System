@@ -1,17 +1,37 @@
 /*
- * HID RFID Wiegand Interface for ESP32
- * Based on @dc540_nova's Github repository for basic Arduino interface
- * https://github.com/dc540/arduinohidprox
- * Modified by @T3ch404, 6/23/2023 
+ * HID RFID Wiegand Access Control System using ESP32
+ * Created by @T3ch404, 6/24/2023
+ * Wiegand protocol handling based on @dc540_nova's Github repo https://github.com/dc540/arduinohidprox
  * 
- * Version 0.1 removes hard-coded if/else statments for each card and adds a card info structure 
- * along with an allow list in order to make adding new allowed users/cards easier and scalable.
+ * Version 0.2 adds a basic HTTP auth protected web interface.
+ * This interface allows users to add, modify, and/or remove cards from the allow list.
+ * 
+ * SECURITY NOTE: HTTPS is not included in this program. This means all connections are sent and recieved in clear-text. 
+ *                Make sure to keep this device on a separate and secure network segment to prevent network monitoring/plain-text password scraping.
+ * 
+ * TODO Items:
+ *    Review/standardize comments and variable names
+ *    HTTPS? - It looks like as of writing this there is no good option for HTTPS on the ESP32. 
+ *             There are options but they do not allow the use of forms and limit to single connections
+ *    Add logging to SD
+ *    Add learn card functionality
 */
 
 // ---------- Setup Libraries ----------
 #include <FastLED.h>
+#include <WiFi.h>
+#include <ESPAsyncWebSrv.h>
 
 // ---------- Setup global variables ----------
+// Web interface
+const char* ssid = "WiFi_SSID";
+const char* password = "WiFi_Password";
+
+const char* httpUsername = "admin";
+const char* httpPassword = "password123";
+
+AsyncWebServer server(80);
+
 // FastLED
 #define NUM_LEDS 1                   // number of status LEDs
 #define DATA_PIN 4                   // data pin to controll status LEDs
@@ -28,8 +48,6 @@ unsigned char flagDone;              // goes low when data is currently being ca
 unsigned int weigand_counter;        // countdown until we assume there are no more bits
 unsigned long facilityCode=0;        // decoded facility code
 unsigned long cardCode=0;            // decoded card code
-unsigned long keyPress=0;
-char userName[10] = "         ";
 
 // GPIO/Relays
 int RelayA = 32;
@@ -38,19 +56,17 @@ int RelayB = 33;
 // Structure to hold card and card holder information
 struct cardInfo {
   int id;
-  char cardHolderName[20];
+  String cardHolderName;
   unsigned long facilityCode;
   unsigned long cardCode;
 };
 
 // Allow list of cards and cardholder info
-cardInfo allowedCards[] = {
+const int MAX_ALLOWED_CARDS = 99;
+cardInfo allowedCards[MAX_ALLOWED_CARDS] = {
   {1, "T3ch404", 123, 123123}          // id, Name, Facility Code, Card Code
-  // Add more allowed cards here
+  // Add more pre-defined cards here
 };
-
-// Divide the size of allowedCards[] list in bytes by the size in bytes of the first element in the allowedCards[] list
-const int NUMALLOWEDCARDS = sizeof(allowedCards) / sizeof(allowedCards[0]);
 
 // interrupt that happens when DATA0 goes low (0 bit)
 void ISR_INT0() {
@@ -61,8 +77,7 @@ void ISR_INT0() {
 }
  
 // interrupt that happens when DATA1 goes low (1 bit)
-void ISR_INT1()
-{
+void ISR_INT1() {
   //Serial.print("1");   // uncomment this line to display raw binary (THIS DOES NOT WORK WITH ESP32)
   databits[bitCount] = 1;
   bitCount++;
@@ -71,22 +86,28 @@ void ISR_INT1()
 }
 
 // this function runs when a card is scanned to check if the facilityCode/cardCode should be allowed access
-void accessCheck()
-{
+void accessCheck() {
   // Serial logging
   Serial.print("FC = ");
   Serial.print(facilityCode);
   Serial.print(", CC = ");
   Serial.println(cardCode); 
 
+  // If a null card is read, deny access
+  if (facilityCode == 0 || cardCode == 0) {
+    accessDenied();
+    return;
+  }
+
   // Check if the scanned card is in the allowedCards list
-  for (int i = 0; i < NUMALLOWEDCARDS; i++) {
+  for (int i = 0; i < MAX_ALLOWED_CARDS; i++) {
     if (facilityCode == allowedCards[i].facilityCode && cardCode == allowedCards[i].cardCode) {
       accessGranted();
       return;
     }
   }
   accessDenied();
+  return;
 }
 
 // this function is run if a card has been scanned that has permissions to access
@@ -126,8 +147,13 @@ void accessDenied(void) {
   FastLED.show();
 }
 
-void setup()
-{
+bool authenticate(AsyncWebServerRequest* request) {
+    if (!request->authenticate(httpUsername, httpPassword))
+      return false;
+    return true;
+  }
+
+void setup() {
   // Serial setup
   Serial.begin(9600);
   Serial.println("Entering setup...");
@@ -151,6 +177,122 @@ void setup()
   attachInterrupt(DATA1, ISR_INT1, FALLING);
   weigand_counter = WEIGAND_WAIT_TIME;
 
+  // WiFi setup
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+
+  Serial.println("Connected to WiFi");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Route handler for the home page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!authenticate(request))
+      return request->requestAuthentication("Restricted Area");
+
+    String html = "<h1>Welcome to the web interface!</h1>";
+    
+    // Display the list of allowed cards
+    html += "<h2>Allowed Cards:</h2>";
+    html += "<ul>";
+    for (int i = 0; i < MAX_ALLOWED_CARDS; i++) {
+      if (allowedCards[i].cardCode != 0) {
+        html += "<li>";
+        html += "ID: " + String(allowedCards[i].id) + ", ";
+        html += "Name: " + String(allowedCards[i].cardHolderName) + ", ";
+        html += "Facility Code: " + String(allowedCards[i].facilityCode) + ", ";
+        html += "Card Code: " + String(allowedCards[i].cardCode);
+        html += "</li>";
+      }
+    }
+    html += "</ul>";
+
+    // Add a form to add or modify a card
+    html += "<h2>Add/Modify Card:</h2>";
+    html += "<form method='POST' action='/addcard'>";
+    html += "ID: <input type='number' name='id'><br>";
+    html += "Name: <input type='text' name='name'><br>";
+    html += "Facility Code: <input type='number' name='facilityCode'><br>";
+    html += "Card Code: <input type='number' name='cardCode'><br>";
+    html += "<input type='submit' value='Add/Modify Card'>";
+    html += "</form>";
+
+    // Add a form to remove a card
+    html += "<h2>Remove Card:</h2>";
+    html += "<form method='POST' action='/removecard'>";
+    html += "ID: <input type='number' name='id'><br>";
+    html += "<input type='submit' value='Remove Card'>";
+    html += "</form>";
+
+    request->send(200, "text/html", html);
+  });
+
+  // Route handler for the /addcard POST request. This allows users to add entries in the allowedCards list
+  server.on("/addcard", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!authenticate(request))
+      return request->requestAuthentication("Restricted Area");
+
+    // Retrieve the card details from the form data
+    String id = request->arg("id");
+    String name = request->arg("name");
+    String facilityCode = request->arg("facilityCode");
+    String cardCode = request->arg("cardCode");
+
+    // Convert String inputs to appropriate types
+    int cardId = id.toInt();
+    unsigned long fc = facilityCode.toInt();
+    unsigned long cc = cardCode.toInt();
+
+    // Check if the card ID is within range
+    if ((id.toInt() < 0) || (id.toInt() > 99)) {
+      request->send(400, "text/plain", "Card ID out of index range");
+      return;
+    }
+
+    // Create a new cardInfo struct with the provided details
+    cardInfo newCard;
+    newCard.id = cardId;
+    newCard.cardHolderName = name;
+    newCard.facilityCode = fc;
+    newCard.cardCode = cc;
+
+    // Add the new card to the allowedCards list
+    allowedCards[cardId] = newCard;
+    //MAX_ALLOWED_CARDS++;
+
+    // Redirect back to the main page
+    request->redirect("/");
+  });
+
+  // Route handler for removing a card from the allowedCards list
+  server.on("/removecard", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!authenticate(request))
+      return request->requestAuthentication("Restricted Area");
+
+    // Retrieve the card ID from the form data
+    String id = request->arg("id");
+    int cardId = id.toInt();
+
+    // Find the card in the allowedCards list and remove it
+    for (int i = 0; i < MAX_ALLOWED_CARDS; i++) {
+      if (allowedCards[i].id == cardId) {
+        allowedCards[i].cardHolderName = "";
+        allowedCards[i].facilityCode = 0;
+        allowedCards[i].cardCode = 0;
+        break;
+      }
+    }
+
+    // Redirect back to the main page
+    request->redirect("/");
+  });
+
+  // Start the server
+  server.begin();
+
   // Log that setup is complete
   delay(2000);
   Serial.print("Leaving setup\n");
@@ -158,8 +300,8 @@ void setup()
   FastLED.show();
 }
  
-void loop()
-{
+void loop() {
+
   // This waits to make sure that there have been no more data pulses before processing data
   if (!flagDone) {
     if (--weigand_counter == 0)
@@ -234,7 +376,6 @@ void loop()
      bitCount = 0;
      facilityCode = 0;
      cardCode = 0;
-     keyPress = 0;
      for (i=0; i<MAX_BITS; i++) 
      {
        databits[i] = 0;
