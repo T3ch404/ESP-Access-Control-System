@@ -4,8 +4,8 @@
  * https://github.com/dc540/arduinohidprox
  * Modified by @T3ch404, 6/23/2023 
  * 
- * Version 0.1 adds a card info structure along with an allow list in order to make adding new 
- * allowed users/cards easier and scalable.
+ * Version 0.1 removes hard-coded if/else statments for each card and adds a card info structure 
+ * along with an allow list in order to make adding new allowed users/cards easier and scalable.
 */
 
 // ---------- Setup Libraries ----------
@@ -35,6 +35,23 @@ char userName[10] = "         ";
 int RelayA = 32;
 int RelayB = 33;
 
+// Structure to hold card and card holder information
+struct cardInfo {
+  int id;
+  char cardHolderName[20];
+  unsigned long facilityCode;
+  unsigned long cardCode;
+};
+
+// Allow list of cards and cardholder info
+cardInfo allowedCards[] = {
+  {1, "T3ch404", 123, 123123}          // id, Name, Facility Code, Card Code
+  // Add more allowed cards here
+};
+
+// Divide the size of allowedCards[] list in bytes by the size in bytes of the first element in the allowedCards[] list
+const int NUMALLOWEDCARDS = sizeof(allowedCards) / sizeof(allowedCards[0]);
+
 // interrupt that happens when DATA0 goes low (0 bit)
 void ISR_INT0() {
   //Serial.print("0");   // uncomment this line to display raw binary (THIS DOES NOT WORK WITH ESP32)
@@ -56,18 +73,20 @@ void ISR_INT1()
 // this function runs when a card is scanned to check if the facilityCode/cardCode should be allowed access
 void accessCheck()
 {
-      // Serial logging
-      Serial.print("FC = ");
-      Serial.print(facilityCode);
-      Serial.print(", CC = ");
-      Serial.println(cardCode); 
+  // Serial logging
+  Serial.print("FC = ");
+  Serial.print(facilityCode);
+  Serial.print(", CC = ");
+  Serial.println(cardCode); 
 
-      // TODO: This is a simple single card check. This should reference a library variable or query a server.
-      if ((facilityCode == 123) && (cardCode == 123123)) 
-      {
-        accessGranted();
-      } else
-        accessDenied();
+  // Check if the scanned card is in the allowedCards list
+  for (int i = 0; i < NUMALLOWEDCARDS; i++) {
+    if (facilityCode == allowedCards[i].facilityCode && cardCode == allowedCards[i].cardCode) {
+      accessGranted();
+      return;
+    }
+  }
+  accessDenied();
 }
 
 // this function is run if a card has been scanned that has permissions to access
